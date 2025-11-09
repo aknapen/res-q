@@ -1,6 +1,8 @@
 import stim
 import numpy as np
 
+from util import log_binary_search
+
 """
 Rare-event splitting simulator for Stim circuits
 
@@ -344,6 +346,26 @@ class RareEventSimulator:
             pin = ps[i + 1]
             # produce samples from pi|F via MCMC
             samples = self.sample_failures(pi, num_jumps=self.shots_per_chain)
+            
+            samples_jn = self.sample_failures(pin, num_jumps=self.shots_per_chain)
+            
+            def pi_j_func(E):
+                return self._approx_prob_of_set(E, pi)
+            
+            def pi_j_plus_1_func(E):
+                return self._approx_prob_of_set(E, pin)
+            
+            C = log_binary_search(
+                samples, 
+                samples_jn,
+                pi_j_func, 
+                pi_j_plus_1_func,
+                tolerance=1e-9,
+                max_iter=100
+            )
+        
+        
+        
             # estimate ratio using Bennett-type estimator (g(x) = 1/(1+x))
             # compute weights w_j = g(C*pi(E)/pi+1(E)) and choose C satisfying eq (4)
             # For simplicity we search for C by binary search on log-space
