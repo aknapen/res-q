@@ -3,6 +3,20 @@ import numpy as np
 
 from util import log_binary_search
 
+from dataclasses import dataclass, field
+import math
+import random
+from typing import List, Tuple, Set, Dict, Optional, Any
+
+import stim
+import pymatching
+
+from qldpc.circuits.noise_model import SI1000NoiseModel, NoiseRule
+from qldpc.objects import Pauli, PauliXZ
+from qldpc.circuits import get_memory_experiment
+from qldpc.codes.quantum import CSSCode, SurfaceCode
+from qldpc.circuits.bookkeeping import QubitIDs
+
 """
 Rare-event splitting simulator for Stim circuits
 
@@ -69,82 +83,127 @@ Mayer et al., "Rare Event Simulation of Quantum Error-Correcting Circuits"
 
 """
 
-from dataclasses import dataclass, field
-import math
-import random
-from typing import List, Tuple, Set, Dict, Optional, Any
-
-# We import stim at runtime (the user must have it installed locally).
-try:
-    import stim
-except Exception as e:
-    stim = None
-
 # Type aliases
+Gate = Tuple[int, Tuple[int], str] # (gate_index, (gate_targets), noise_channel)
 GateFault = Tuple[int, str]  # (gate_index, fault_label)
 EventSet = frozenset
 
-
 @dataclass
 class RareEventSimulator:
-    circuit_path: Optional[str] = None
-    circuit: Optional[Any] = None  # stim.Circuit if provided directly
+    distance: int = 3
     physical_p: float = 1e-3  # starting p for MC setup
     target_p: float = 1e-9
     shots_per_chain: int = 200  # N in the paper for expectation estimates
-    distance: Optional[int] = None
     rng_seed: Optional[int] = None
     max_steps_per_chain: int = 10000
+    basis: PauliXZ = Pauli.X
 
     # internal fields
-    dem: Any = field(default=None, init=False)
-    gate_fault_list: List[GateFault] = field(default_factory=list, init=False)
-    gate_failure_prob: Dict[int, float] = field(default_factory=dict, init=False)
-    gate_fault_prob: Dict[GateFault, float] = field(default_factory=dict, init=False)
+    circuit: stim.Circuit = field(default=None, init=False)
+    dem: stim.DetectorErrorModel = field(default=None, init=False)
+    gate_list: List[Gate] = field(default_factory=list, init=False)
+    gate_failure_prob: Dict[Gate, float] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
         if self.rng_seed is not None:
             random.seed(self.rng_seed)
-        if self.circuit is None and self.circuit_path is None:
-            raise ValueError("Either circuit_path or circuit must be provided.")
-        if stim is None:
-            raise RuntimeError("stim is not installed in this environment. Install with `pip install stim`.")
-        if self.circuit is None:
-            self.circuit = stim.Circuit.from_file(self.circuit_path)
-        # Build DEM and gate-fault catalog
-        self.dem = self.circuit.detector_error_model(decompose_operations=True)
+
+        self.code: CSSCode = SurfaceCode(rows=self.distance, cols=self.distance, rotated=True)
+        self.noise_model = SI1000NoiseModel(self.physical_p)
+        
+        self.circuit: stim.Circuit = get_memory_experiment(
+            self.code,
+            basis=self.basis,
+            num_rounds=self.distance,
+            noise_model=self.noise_model
+        )
+
+        self.decoder = pymatching.Matching(
+            self.circuit.detector_error_model(decompose_errors=True)
+        )
+
         self._catalog_gate_faults()
 
     def _catalog_gate_faults(self):
-        """Catalog all gate indices and possible faults using the DetectorErrorModel.
+        """Catalog all possible failing gates in a Stim circuit.
 
-        The DEM encodes error events as lines describing Pauli products on
-        qubits and detector flips. We'll enumerate them and treat each line as a
-        distinct (gate,fault) candidate. This is an approximation: a DEM line
-        corresponds to an elementary error event (often caused by a single
-        instruction failure) and the paper's gate-fault pairs can be mapped to
-        DEM lines.
+        Gates are cataloged uniquely based on their location within the Stim
+        circuit (instruction index) as well as the qubits they operate on (to
+        differentiate the same instruction action on multiple (sets) of qubits).
         """
-        # Each DEM line has a .probability and .pauli_map string in stim's
-        # textual representation; we parse the textual DEM for lines and use
-        # indices as identifiers.
-        dem_txt = str(self.dem)
-        lines = [l.strip() for l in dem_txt.splitlines() if l.strip()]
-        # We'll parse lines that start with 'error' (the textual format)
-        gate_faults = []
-        for i, l in enumerate(lines):
-            if l.startswith('error '):
-                # Use index i as gate identifier and the whole line as label
-                gate_faults.append((i, l))
-        # Save catalog
-        self.gate_fault_list = gate_faults
-        # Assign simplistic probabilities: use dem.line probability when parseable
-        for gid, line in gate_faults:
-            # try to find probability 'p=...' inside line
-            p = self._parse_probability_from_dem_line(line)
-            self.gate_fault_prob[(gid, line)] = p if p is not None else self.physical_p
-            # set gate failure prob to physical_p as a conservative default
-            self.gate_failure_prob[gid] = self.gate_failure_prob.get(gid, self.physical_p)
+        active_qubits: set[int] = set()
+        measure_or_reset_in_moment = False
+
+        instr: stim.CircuitInstruction
+        for (i, instr) in enumerate(self.circuit.without_noise().flattened()):
+            # A TICK instruction indicates a new "moment" (timeslice) in the quantum circuit
+            # so we need to re-evaluate the sets of active and idle qubits
+            if instr.name == "TICK":
+                # Calculate idle qubits
+                qubit_ids = QubitIDs.from_code(self.code)
+                all_qubits = set(qubit_ids.data + qubit_ids.check)
+                
+                idle_qubits = all_qubits - active_qubits
+
+                for qubit in idle_qubits:
+                    gate_channel = "IDLE"
+                    # i-1 here so that the noise channel gets added
+                    # at the end of the CURRENT moment, right before 
+                    # the TICK marking the start of the NEXT moment
+                    gate: Gate = (i-1, qubit, gate_channel)
+
+                    self.gate_list.append(gate)
+                    self.gate_failure_prob[gate] = self.noise_model.idle_error
+
+                    if measure_or_reset_in_moment:
+                        gate_channel = "MEAS_RESET_IDLE"
+                        # i-1 here so that the noise channel gets added
+                        # at the end of the CURRENT moment, right before 
+                        # the TICK marking the start of the NEXT moment
+                        gate: Gate = (i-1, qubit, gate_channel)
+                        self.gate_list.append(gate)
+                        self.gate_failure_prob[gate] = self.noise_model.additional_error_waiting_for_m_or_r
+
+
+                # Reset state for the next circuit moment
+                active_qubits.clear()
+                measure_or_reset_in_moment = False
+            
+            noise_rule: NoiseRule = self.noise_model.get_noise_rule(instr)
+
+            # The instruction is some type of noisy gate
+            if noise_rule is not None:
+                target_group: List[stim.GateTarget]
+                for target_group in instr.target_groups():
+                    # We define a gate uniquely by its position within the circuit (instruction #)
+                    # and the qubit(s) it acts on (instruction targets)
+                    gate_targets = tuple([target.qubit_value for target in target_group])
+                    
+                    # Update the set of qubits involved in operations during this moment
+                    active_qubits = active_qubits | set(gate_targets)
+
+                    gate_prob = 0
+                    gate_channel = ""
+                    if noise_rule.reset_error != 0:
+                        gate_prob = noise_rule.reset_error
+                        gate_channel = "Z" if self.basis == Pauli.X else "X"
+                        measure_or_reset_in_moment = True
+                    elif noise_rule.readout_error != 0:
+                        gate_prob = noise_rule.readout_error
+                        gate_channel = "Z" if self.basis == Pauli.X else "X"
+                        measure_or_reset_in_moment = True
+                    else:
+                        for channel, prob in noise_rule.after.items():
+                            # NOTE: this is an assumption that only
+                            # one probability is associated with this 
+                            # noise rule, which may not be the case for
+                            # MPP-type instructions
+                            gate_prob = prob[0]
+                            gate_channel = channel
+                    
+                    gate: Gate = (i, gate_targets, gate_channel)
+                    self.gate_list.append(gate)
+                    self.gate_failure_prob[gate] = gate_prob
 
     @staticmethod
     def _parse_probability_from_dem_line(line: str) -> Optional[float]:
@@ -425,14 +484,17 @@ class RareEventSimulator:
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--circuit', required=True, help='Path to Stim circuit file (with DETECTOR/OBSERVABLE)')
-    parser.add_argument('--p0', type=float, default=1e-3)
-    parser.add_argument('--pt', type=float, default=1e-9)
-    parser.add_argument('--shots', type=int, default=200)
-    parser.add_argument('--distance', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=0)
+    
+    parser.add_argument("-d", "--distance", type=int, default=3, help="Distance of the error correction code to simulate")
+    parser.add_argument('--p0', type=float, default=1e-3, help="Initial physical error rate for performing Monte Carlo sampling")
+    parser.add_argument('--pt', type=float, default=1e-9, help="Lowest physical error rate at which to run rare event simulation")
+    parser.add_argument('--shots', type=int, default=200, help="Number of Markov chain samples to generate")
+    parser.add_argument('--seed', type=int, default=0, help="Seed for random number generator")
+
     args = parser.parse_args()
-    sim = RareEventSimulator(circuit_path=args.circuit, physical_p=args.p0, target_p=args.pt, shots_per_chain=args.shots, distance=args.distance, rng_seed=args.seed)
+
+    sim = RareEventSimulator(distance=args.distance, physical_p=args.p0, target_p=args.pt, 
+                             shots_per_chain=args.shots, rng_seed=args.seed)
     out = sim.run()
     import json
     print(json.dumps(out, indent=2))
