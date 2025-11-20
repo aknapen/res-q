@@ -238,44 +238,50 @@ class RareEventSimulator:
 
         return ps
 
+    def inject_events(self, event_set: Set[GateFault]) -> stim.Circuit:
+        '''
+            Given a set of error events, constructs the corresponding Stim
+            circuit in which those events occur.
+        '''
+        target_circuit: stim.Circuit = self.circuit.without_noise().flattened()
+        # Sort events by gate index
+        event_list = sorted(event_set, key=lambda x: x[0][0])
+
+        # Each time we insert a new gate error, we need to shift placement
+        # of the next gate error by 1 relative to its specified gate index
+        index_offset = 0
+
+        for event in event_list:
+            (gate, fault) = event
+            (gate_index, qubits, _) = gate
+            for i, f in enumerate(f):
+                if f != "I":
+                    target_circuit.insert(
+                        gate_index+1+index_offset, 
+                        stim.CircuitInstruction(fault+"_ERROR", [qubits[i]], [1.0])
+                    )
+                    index_offset += 1
+        
+        return target_circuit
+
     def is_malicious(self, event_set: Set[GateFault]) -> bool:
         """Test whether a given set of gate-faults causes a logical failure.
 
         Implementation strategy:
         - Create a copy of the original circuit.
         - For each (gate_index, label) in the event_set, deterministically inject
-          corresponding Pauli operations at the appropriate location. Here we
-          use the DEM to infer which Pauli(s) to apply by looking at the DEM
-          line's text (approximate parsing). This is an heuristic; for robust
-          mapping you should map using your circuit construction metadata.
-        - Run the noiseless simulator and check whether any OBSERVABLE flipped.
+          corresponding Pauli operations at the appropriate location in the circuit.
+        - Generate a sample from the circuit, and compare the flipped observable with
+          the prediction outputted by the decoder.
         """
-        # Note: this is an approximate automated method. For full correctness
-        # you may need to adapt this to how your circuit and DEM map events to
-        # Pauli products.
-        c = stim.Circuit.from_file(self.circuit_path) if self.circuit_path else self.circuit.copy()
-        # naive approach: append Pauli gates at end for each event (this
-        # assumes a Pauli after the whole circuit is fine because Pauli
-        # operators commute with measurement wrapper in Stim iff mapped
-        # appropriately). A better method is to insert at the gate location.
-        for gid, line in event_set:
-            # parse targets from the DEM line heuristically: look for items like 'X0' or 'Z5'
-            ops = self._parse_paulis_from_dem_line(line)
-            for op, q in ops:
-                c.append(op + ' ' + str(q))
-        # run noiseless simulation and check observables
-        sim = stim.TableauSimulator()
-        sim.do_circuit(c)
-        # Stim's current_measurement_record holds measurement results; however
-        # the reliable way to check a logical observable is to see if any
-        # observable toggled. We'll check via DETECTOR/OBSERVABLE parity by
-        # extracting measurements for OBSERVABLES.
-        # If circuit contains OBSERVABLE_INCLUDE or OBSERVABLE, the
-        # simulator's 'current_observable' helpers may be used. We'll use a
-        # conservative approach: if any observable measurement bit is 1 -> fail.
-        meas = sim.current_measurement_record()
-        # if any measurement bit is 1, assume logical failure (heuristic)
-        return any(meas)
+        circuit: stim.Circuit = self.inject_events(event_set)
+        sampler = circuit.compile_detector_sampler()
+        dets, obs = sampler.sample(shots=1, separate_observables=True)
+
+        pred = self.decoder.decode(dets[0])
+
+        return pred != obs[0]
+
 
     def metropolis_step(self, current: Set[GateFault], p_phys: float) -> Set[GateFault]:
         """Perform one Metropolis step modifying a single gate's fault as in paper.
@@ -324,7 +330,7 @@ class RareEventSimulator:
         """
         # seed initial failing events via direct Monte Carlo (or heuristic)
         # Simple heuristic: randomly pick sets of size ceil(d/2) until one is malignant
-        d = self.distance or 5
+        d = self.distance
         k = math.ceil(d / 2)
         initial = None
         tries = 0
