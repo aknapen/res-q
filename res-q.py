@@ -205,25 +205,6 @@ class RareEventSimulator:
                     self.gate_list.append(gate)
                     self.gate_failure_prob[gate] = gate_prob
 
-    @staticmethod
-    def _parse_probability_from_dem_line(line: str) -> Optional[float]:
-        # attempt to find a floating p value in the line like 'p=0.001' or '0.001'
-        import re
-        m = re.search(r'p\s*=\s*([0-9.eE+-]+)', line)
-        if m:
-            try:
-                return float(m.group(1))
-            except:
-                return None
-        # fallback: try to find first bare float
-        m = re.search(r'([0-9]+\.[0-9eE+-]+)', line)
-        if m:
-            try:
-                return float(m.group(1))
-            except:
-                return None
-        return None
-
     # ---------- Core algorithm pieces ----------
     def splitting_schedule(self, p0: float, pt: float) -> List[float]:
         """Generate decreasing sequence of p values from p0 to pt using heuristic.
@@ -232,18 +213,15 @@ class RareEventSimulator:
         with wi = max(d/2, p_i * G). We estimate G as the number of cataloged DEM lines.
         """
         ps = [p0]
-        G = max(1, len(self.gate_fault_list))
-        d = self.distance or 5
+        G = len(self.gate_list)
+        d = self.distance
         while ps[-1] > pt:
             pi = ps[-1]
-            wi = max(math.ceil(d / 2), max(1, int(pi * G)))
+            wi = max(d/2, pi * G)
             factor = 2 ** (-1.0 / math.sqrt(wi))
             pn = pi * factor
-            if pn >= pi:
-                pn = pi * 0.5
             ps.append(pn)
-            if len(ps) > 200:
-                break
+
         return ps
 
     def is_malicious(self, event_set: Set[GateFault]) -> bool:
@@ -404,9 +382,9 @@ class RareEventSimulator:
             pi = ps[i]
             pin = ps[i + 1]
             # produce samples from pi|F via MCMC
-            samples = self.sample_failures(pi, num_jumps=self.shots_per_chain)
+            E_num = self.sample_failures(pi, num_jumps=self.shots_per_chain)
             
-            samples_jn = self.sample_failures(pin, num_jumps=self.shots_per_chain)
+            E_den = self.sample_failures(pin, num_jumps=self.shots_per_chain)
             
             def pi_j_func(E):
                 return self._approx_prob_of_set(E, pi)
@@ -414,9 +392,10 @@ class RareEventSimulator:
             def pi_j_plus_1_func(E):
                 return self._approx_prob_of_set(E, pin)
             
+            # Search for a value C which expectation at i == expectation at i+1
             C = log_binary_search(
-                samples, 
-                samples_jn,
+                E_num, 
+                E_den,
                 pi_j_func, 
                 pi_j_plus_1_func,
                 tolerance=1e-9,
