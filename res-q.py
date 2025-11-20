@@ -85,8 +85,22 @@ Mayer et al., "Rare Event Simulation of Quantum Error-Correcting Circuits"
 
 # Type aliases
 Gate = Tuple[int, Tuple[int], str] # (gate_index, (gate_targets), noise_channel)
-GateFault = Tuple[int, str]  # (gate_index, fault_label)
+Fault = Tuple[str] # tuple of Pauli strings
+GateFault = Tuple[Gate, Fault]
 EventSet = frozenset
+
+# Static fault lookup table
+channel_faults = {
+    "Z": [("Z")],
+    "DEPOLARIZE1": [("Z"), ("X"), ("Y")],
+    "IDLE": [("Z"), ("X"), ("Y")],
+    "MEAS_RESET_IDLE": [("Z"), ("X"), ("Y")],
+    "DEPOLARIZE2": [("I","X"), ("I","Y"), ("I","Z"), 
+                    ("X","X"), ("X","Y"), ("X","Z"), 
+                    ("Y","X"), ("Y","Y"), ("Y","Z"), 
+                    ("Z","X"), ("Z","Y"), ("Z","Z"), 
+                    ("X","I"), ("Y","I"), ("Z","I")],
+}
 
 @dataclass
 class RareEventSimulator:
@@ -150,7 +164,7 @@ class RareEventSimulator:
                     # i-1 here so that the noise channel gets added
                     # at the end of the CURRENT moment, right before 
                     # the TICK marking the start of the NEXT moment
-                    gate: Gate = (i-1, qubit, gate_channel)
+                    gate: Gate = (i-1, tuple(qubit), gate_channel)
 
                     self.gate_list.append(gate)
                     self.gate_failure_prob[gate] = self.noise_model.idle_error
@@ -160,7 +174,7 @@ class RareEventSimulator:
                         # i-1 here so that the noise channel gets added
                         # at the end of the CURRENT moment, right before 
                         # the TICK marking the start of the NEXT moment
-                        gate: Gate = (i-1, qubit, gate_channel)
+                        gate: Gate = (i-1, tuple(qubit), gate_channel)
                         self.gate_list.append(gate)
                         self.gate_failure_prob[gate] = self.noise_model.additional_error_waiting_for_m_or_r
 
@@ -210,7 +224,7 @@ class RareEventSimulator:
         """Generate decreasing sequence of p values from p0 to pt using heuristic.
 
         For simplicity we use the heuristic in the paper: p_{i+1} = p_i * 2^{-1/sqrt(wi)}
-        with wi = max(d/2, p_i * G). We estimate G as the number of cataloged DEM lines.
+        with wi = max(d/2, p_i * G).
         """
         ps = [p0]
         G = len(self.gate_list)
@@ -263,74 +277,42 @@ class RareEventSimulator:
         # if any measurement bit is 1, assume logical failure (heuristic)
         return any(meas)
 
-    @staticmethod
-    def _parse_paulis_from_dem_line(line: str) -> List[Tuple[str, int]]:
-        # Very permissive parser: find tokens like 'X0', 'Z12', 'Y3' in the line
-        import re
-        tokens = re.findall(r'([XYZ])\s*([0-9]+)', line)
-        parsed = []
-        for p, q in tokens:
-            parsed.append((p, int(q)))
-        return parsed
-
     def metropolis_step(self, current: Set[GateFault], p_phys: float) -> Set[GateFault]:
         """Perform one Metropolis step modifying a single gate's fault as in paper.
 
         Returns the new set (may be the same as current if rejected).
         """
-        # pick a gate uniformly among catalog
-        gid, _ = random.choice(self.gate_fault_list)
-        # pick a fault label for that gate uniformly from available in catalog
-        # find all catalog entries with this gid
-        options = [gf for gf in self.gate_fault_list if gf[0] == gid]
-        candidate = random.choice(options)
-        # construct E'
-        # if gate not present in current, add (gid, candidate_label)
-        present = [e for e in current if e[0] == gid]
-        if not present:
-            new = set(current)
-            new.add(candidate)
-        else:
-            # replace existing pair for that gate
-            new = set(current)
-            # remove any with same gid
-            for e in present:
-                if e in new:
-                    new.remove(e)
-            # if candidate equals removed, we effectively removed it
-            if candidate not in present:
-                new.add(candidate)
-        # compute acceptance q = min(1, Pr(E')/Pr(E)) but only if E' is malignant
-        # We compute Pr(E) as product over gates: for gates in set use Pr(g)*Prg(f),
-        # for gates not in set use (1-Pr(g)). We'll use the stored gate_failure_prob
-        def prob_of_set(S: Set[GateFault], p=p_phys) -> float:
-            # approximate: use self.gate_failure_prob and self.gate_fault_prob
-            prod = 1.0
-            seen_gates = set()
-            for gid2, label in S:
-                # Pr(g) approx p
-                prg = self.gate_failure_prob.get(gid2, p)
-                prgf = self.gate_fault_prob.get((gid2, label), prg)
-                prod *= prg * prgf
-                seen_gates.add(gid2)
-            # multiply (1-Pr(g)) for gates not in seen_gates
-            # we treat G as number of unique gate ids
-            all_gids = set(g for g, _ in self.gate_fault_list)
-            for g in all_gids - seen_gates:
-                prg = self.gate_failure_prob.get(g, p)
-                prod *= (1 - prg)
-            return prod
+        # pick a gate uniformly among catalog and a fault uniformly at random
+        # for that gate
+        gate: Gate = random.choice(self.gate_fault_list)
+        (_, _, channel) = gate
+        fault: Fault = random.choice(channel_faults[channel])
 
-        # Only consider acceptance if new is malignant
-        if not self.is_malicious(new):
-            return current
-        pe = prob_of_set(current)
-        pe2 = prob_of_set(new)
-        if pe == 0:
-            q = 1.0
-        else:
-            q = min(1.0, pe2 / pe)
-        if random.random() < q:
+        # Probability that the gate would have failed
+        prob_g = self.gate_failure_prob[gate]
+        # Probability that, given the gate has failed, 
+        # the failure would have been the one chosen
+        prob_g_f = 1 / len(channel_faults[channel])
+        
+        event: GateFault = (gate, fault)
+
+        current_gates = set([gf[0] for gf in current])
+        if gate in current_gates: # selected gate is already in error set
+            # find the (gate, fault) currently in the error set
+            current_event: GateFault = next((e for e in current if e[0] == gate), None)
+            new = (current | set(event)) - set(current_event)
+
+            (_, current_fault) = current_event
+            if fault == current_fault:
+                accept = 1
+            else:
+                accept = prob_g_f
+        else: # selected gate is not already in the error set
+            new = current | set(event)
+            accept = np.random.random() <= ((prob_g / (1 - prob_g)) * prob_g_f)
+
+        # Only consider acceptance if new causes a logical failure
+        if self.is_malicious(new) and accept:
             return new
         else:
             return current
