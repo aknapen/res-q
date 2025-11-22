@@ -21,7 +21,7 @@ def log_binary_search(samples_j, samples_j_plus_1,  pi_j_func, pi_j_plus_1_func,
     
 
     log_C_min = 1  
-    log_C_max = 10.0   
+    log_C_max = 100.0   
   
     
     for i in range(max_iter):
@@ -38,13 +38,17 @@ def log_binary_search(samples_j, samples_j_plus_1,  pi_j_func, pi_j_plus_1_func,
         if abs(difference) < tolerance:
             print(f"\nConverged! C = {C:.6f}")
             return C
+        if log_C_max <= log_C_min:
+            print(f"\nBounds may not have converged! C = {C:.6f}")
+            return C
         
         # Update bounds based on the sign of difference
         # If top > bottom, we need to decrease C , I am not sure about this because when C increases the top one decrease because of 1/(1+Cx)
-        if difference > 0:
+        if difference < 0:
             log_C_max = log_C
         else:
             log_C_min = log_C
+        
     
     return C
 

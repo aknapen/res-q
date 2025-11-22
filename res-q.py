@@ -137,6 +137,22 @@ class RareEventSimulator:
         )
 
         self._catalog_gate_faults()
+        
+        # Create all possible (gate, fault) combinations
+        self.gate_fault_list = []
+        for gate in self.gate_list:
+            (_, _, channel) = gate
+            for fault in channel_faults[channel]:
+                self.gate_fault_list.append((gate, fault))
+                
+        # Create conditional fault probabilities: P(fault | gate failed)
+        self.gate_fault_prob = {}
+        for gate_fault in self.gate_fault_list:
+            gate, fault = gate_fault
+            (_, _, channel) = gate
+            # Uniform distribution over possible faults for this channel
+            prob_fault_given_failure = 1.0 / len(channel_faults[channel])
+            self.gate_fault_prob[gate_fault] = prob_fault_given_failure
 
     def _catalog_gate_faults(self):
         """Catalog all possible failing gates in a Stim circuit.
@@ -164,7 +180,8 @@ class RareEventSimulator:
                     # i-1 here so that the noise channel gets added
                     # at the end of the CURRENT moment, right before 
                     # the TICK marking the start of the NEXT moment
-                    gate: Gate = (i-1, tuple(qubit), gate_channel)
+                    # gate: Gate = (i-1, tuple(qubit), gate_channel)
+                    gate: Gate = (i-1, (qubit,), gate_channel)
 
                     self.gate_list.append(gate)
                     self.gate_failure_prob[gate] = self.noise_model.idle_error
@@ -174,7 +191,10 @@ class RareEventSimulator:
                         # i-1 here so that the noise channel gets added
                         # at the end of the CURRENT moment, right before 
                         # the TICK marking the start of the NEXT moment
-                        gate: Gate = (i-1, tuple(qubit), gate_channel)
+                        
+                        # gate: Gate = (i-1, tuple(qubit), gate_channel)
+                        gate: Gate = (i-1, (qubit,), gate_channel)
+                        
                         self.gate_list.append(gate)
                         self.gate_failure_prob[gate] = self.noise_model.additional_error_waiting_for_m_or_r
 
@@ -254,11 +274,13 @@ class RareEventSimulator:
         for event in event_list:
             (gate, fault) = event
             (gate_index, qubits, _) = gate
-            for i, f in enumerate(f):
+            # for i, f in enumerate(f):
+            for i, f in enumerate(fault):
                 if f != "I":
                     target_circuit.insert(
                         gate_index+1+index_offset, 
-                        stim.CircuitInstruction(fault+"_ERROR", [qubits[i]], [1.0])
+                        # stim.CircuitInstruction(fault+"_ERROR", [qubits[i]], [1.0])
+                        stim.CircuitInstruction(f+"_ERROR", [qubits[i]], [1.0])
                     )
                     index_offset += 1
         
@@ -290,7 +312,11 @@ class RareEventSimulator:
         """
         # pick a gate uniformly among catalog and a fault uniformly at random
         # for that gate
-        gate: Gate = random.choice(self.gate_fault_list)
+        # gate: Gate = random.choice(self.gate_fault_list)
+
+        gate_fault: GateFault = random.choice(self.gate_fault_list)
+        gate, _ = gate_fault
+
         (_, _, channel) = gate
         fault: Fault = random.choice(channel_faults[channel])
 
@@ -306,7 +332,8 @@ class RareEventSimulator:
         if gate in current_gates: # selected gate is already in error set
             # find the (gate, fault) currently in the error set
             current_event: GateFault = next((e for e in current if e[0] == gate), None)
-            new = (current | set(event)) - set(current_event)
+            # new = (current | set(event)) - set(current_event)
+            new = (current | {event}) - {current_event}
 
             (_, current_fault) = current_event
             if fault == current_fault:
@@ -314,7 +341,8 @@ class RareEventSimulator:
             else:
                 accept = prob_g_f
         else: # selected gate is not already in the error set
-            new = current | set(event)
+            # new = current | set(event)
+            new = current | {event}
             accept = np.random.random() <= ((prob_g / (1 - prob_g)) * prob_g_f)
 
         # Only consider acceptance if new causes a logical failure
@@ -380,44 +408,56 @@ class RareEventSimulator:
             def pi_j_plus_1_func(E):
                 return self._approx_prob_of_set(E, pin)
             
-            # Search for a value C which expectation at i == expectation at i+1
             C = log_binary_search(
-                E_num, 
-                E_den,
-                pi_j_func, 
-                pi_j_plus_1_func,
+                E_num,  # samples from π_i|F
+                E_den,  # samples from π_{i+1|F}
+                lambda E: self._approx_prob_of_set(E, pi),     # π_i(E)
+                lambda E: self._approx_prob_of_set(E, pin),    # π_{i+1}(E)
                 tolerance=1e-9,
                 max_iter=100
             )
-        
-        
-        
-            # estimate ratio using Bennett-type estimator (g(x) = 1/(1+x))
-            # compute weights w_j = g(C*pi(E)/pi+1(E)) and choose C satisfying eq (4)
-            # For simplicity we search for C by binary search on log-space
-            def estimate_ratio(C: float) -> float:
-                vals_i = []
-                vals_in = []
-                for s in samples:
-                    # compute pi(E) and pi+1(E) approximately via prob_of_set
-                    # reuse approx prob_of_set defined locally
-                    piE = self._approx_prob_of_set(s, pi)
-                    pinE = self._approx_prob_of_set(s, pin)
-                    if piE == 0 or pinE == 0:
-                        continue
-                    x = C * (piE / pinE)
-                    vals_i.append(1.0 / (1.0 + x))
-                # Similarly we would need samples from pi+1|F; to avoid a nested MCMC
-                # we use the approximation that samples are similar and estimate the ratio
-                # using the average of the above as a heuristic. A fully correct
-                # implementation requires generating samples at pi+1 as well.
-                if not vals_i:
-                    return 1.0
-                return sum(vals_i) / len(vals_i)
-
-            C_est = 1.0
-            ratio = pin / pi  # placeholder; full method requires solving eq (4)
+            ratio = C  # Use C as the ratio estimate
             ratios.append(ratio)
+            
+            
+            
+            # # Search for a value C which expectation at i == expectation at i+1
+            # C = log_binary_search(
+            #     E_num, 
+            #     E_den,
+            #     pi_j_func, 
+            #     pi_j_plus_1_func,
+            #     tolerance=1e-9,
+            #     max_iter=100
+            # )
+        
+        
+            # # estimate ratio using Bennett-type estimator (g(x) = 1/(1+x))
+            # # compute weights w_j = g(C*pi(E)/pi+1(E)) and choose C satisfying eq (4)
+            # # For simplicity we search for C by binary search on log-space
+            # def estimate_ratio(C: float) -> float:
+            #     vals_i = []
+            #     vals_in = []
+            #     for s in samples:
+            #         # compute pi(E) and pi+1(E) approximately via prob_of_set
+            #         # reuse approx prob_of_set defined locally
+            #         piE = self._approx_prob_of_set(s, pi)
+            #         pinE = self._approx_prob_of_set(s, pin)
+            #         if piE == 0 or pinE == 0:
+            #             continue
+            #         x = C * (piE / pinE)
+            #         vals_i.append(1.0 / (1.0 + x))
+            #     # Similarly we would need samples from pi+1|F; to avoid a nested MCMC
+            #     # we use the approximation that samples are similar and estimate the ratio
+            #     # using the average of the above as a heuristic. A fully correct
+            #     # implementation requires generating samples at pi+1 as well.
+            #     if not vals_i:
+            #         return 1.0
+            #     return sum(vals_i) / len(vals_i)
+
+            # C_est = 1.0
+            # ratio = pin / pi  # placeholder; full method requires solving eq (4)
+            # ratios.append(ratio)
         # multiply ratios to get final
         overall_ratio = 1.0
         for r in ratios:
