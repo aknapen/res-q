@@ -39,7 +39,7 @@ def log_binary_search(samples_j, samples_j_plus_1,  pi_j_func, pi_j_plus_1_func,
             print(f"\nConverged! C = {C:.6f}")
             return C
         if log_C_max <= log_C_min:
-            print(f"\nBounds may not have converged! C = {C:.6f}")
+            # print(f"\nBounds may not have converged! C = {C:.6f}")
             return C
         
         # Update bounds based on the sign of difference
