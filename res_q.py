@@ -117,6 +117,7 @@ class RareEventSimulator:
     dem: stim.DetectorErrorModel = field(default=None, init=False)
     gate_list: List[Gate] = field(default_factory=list, init=False)
     gate_failure_prob: Dict[Gate, float] = field(default_factory=dict, init=False)
+    gate_fault_list: List[Gate] = field(default_factory=list, init=False)
 
     def __post_init__(self):
         if self.rng_seed is not None:
@@ -502,6 +503,6 @@ if __name__ == '__main__':
 
     sim = RareEventSimulator(distance=args.distance, physical_p=args.p0, target_p=args.pt, 
                              shots_per_chain=args.shots, rng_seed=args.seed)
-    out = sim.run()
-    import json
-    print(json.dumps(out, indent=2))
+    # out = sim.run()
+    # import json
+    # print(json.dumps(out, indent=2))
