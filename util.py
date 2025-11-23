@@ -20,14 +20,19 @@ def log_binary_search(samples_j, samples_j_plus_1,  pi_j_func, pi_j_plus_1_func,
     
     
 
-    log_C_min = 1  
-    log_C_max = 100.0   
+    # log_C_min = 1  
+    # log_C_max = 100.0   
+    log_C_min = np.log(0.01)   # or whatever your actual C_min should be
+    log_C_max = np.log(10.0) 
   
+    C_min = 0
+    C_max = 10.0
     
     for i in range(max_iter):
         log_C = (log_C_min + log_C_max) / 2.0
         C = np.exp(log_C)
         
+        # C = (C_min + C_max) / 2.0
         top_exp = IE_function(C,  pi_j_top, pi_j_plus_1_top)
         bottom_exp = IE_function((1.0 / C), pi_j_bottom, pi_j_plus_1_bottom)
         
@@ -36,6 +41,7 @@ def log_binary_search(samples_j, samples_j_plus_1,  pi_j_func, pi_j_plus_1_func,
    
         # Check convergence
         if abs(difference) < tolerance:
+            print(f"\ndifference! d = {difference:.6f}")
             print(f"\nConverged! C = {C:.6f}")
             return C
         if log_C_max <= log_C_min:
@@ -46,9 +52,14 @@ def log_binary_search(samples_j, samples_j_plus_1,  pi_j_func, pi_j_plus_1_func,
         # If top > bottom, we need to decrease C , I am not sure about this because when C increases the top one decrease because of 1/(1+Cx)
         if difference < 0:
             log_C_max = log_C
+            # C_max = C
         else:
+            # C_min = C
             log_C_min = log_C
         
-    
+    print(f"\nBounds may not have converged! C = {C:.6f}")
+    top_exp = IE_function(C,  pi_j_top, pi_j_plus_1_top)
+    bottom_exp = IE_function((1.0 / C), pi_j_bottom, pi_j_plus_1_bottom)
+    print(f"Final difference: {top_exp - bottom_exp}")    
     return C
 
