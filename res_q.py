@@ -1,5 +1,6 @@
 import stim
 import numpy as np
+from scipy.stats import norm
 
 from util import log_binary_search
 
@@ -105,18 +106,18 @@ channel_faults = {
 @dataclass
 class RareEventSimulator:
     distance: int = 3
-    physical_p: float = 1e-3  # starting p for MC setup
+    p0: float = 1e-3  # starting p for MC setup
     target_p: float = 1e-9
     shots_per_chain: int = 200  # N in the paper for expectation estimates
     rng_seed: Optional[int] = None
-    max_steps_per_chain: int = 10000
+    num_warmup_steps: int = 1000
     basis: PauliXZ = Pauli.X
 
     # internal fields
     circuit: stim.Circuit = field(default=None, init=False)
     dem: stim.DetectorErrorModel = field(default=None, init=False)
     gate_list: List[Gate] = field(default_factory=list, init=False)
-    gate_fault_list: List[Gate] = field(default_factory=list, init=False)
+    gate_fault_list: List[GateFault] = field(default_factory=list, init=False)
     gate_failure_prob: Dict[Gate, float] = field(default_factory=dict, init=False)
     gate_fault_prob: Dict[GateFault, float] = field(default_factory=dict, init=False)
 
@@ -125,14 +126,14 @@ class RareEventSimulator:
             random.seed(self.rng_seed)
 
         self.code: CSSCode = SurfaceCode(rows=self.distance, cols=self.distance, rotated=True)
-        self.noise_model = SI1000NoiseModel(self.physical_p)
+        self.noise_model = SI1000NoiseModel(self.p0)
         
         self.circuit: stim.Circuit = get_memory_experiment(
             self.code,
             basis=self.basis,
             num_rounds=self.distance,
             noise_model=self.noise_model
-        )
+        ).flattened()
 
         self.decoder = pymatching.Matching(
             self.circuit.detector_error_model(decompose_errors=True)
@@ -306,8 +307,7 @@ class RareEventSimulator:
 
         return pred != obs[0]
 
-
-    def metropolis_step(self, current: Set[GateFault], p_phys: float) -> Set[GateFault]:
+    def metropolis_step(self, current: Set[GateFault], p: float) -> Set[GateFault]:
         """Perform one Metropolis step modifying a single gate's fault as in paper.
 
         Returns the new set (may be the same as current if rejected).
@@ -319,11 +319,12 @@ class RareEventSimulator:
         gate_fault: GateFault = random.choice(self.gate_fault_list)
         gate, _ = gate_fault
 
+        gate: Gate = random.choice(self.gate_list)
         (_, _, channel) = gate
         fault: Fault = random.choice(channel_faults[channel])
 
         # Probability that the gate would have failed
-        prob_g = self.gate_failure_prob[gate]
+        prob_g = self.gate_failure_prob[gate] * (p / self.p0)
         # Probability that, given the gate has failed, 
         # the failure would have been the one chosen
         prob_g_f = 1 / len(channel_faults[channel])
@@ -334,16 +335,14 @@ class RareEventSimulator:
         if gate in current_gates: # selected gate is already in error set
             # find the (gate, fault) currently in the error set
             current_event: GateFault = next((e for e in current if e[0] == gate), None)
-            # new = (current | set(event)) - set(current_event)
             new = (current | {event}) - {current_event}
 
             (_, current_fault) = current_event
             if fault == current_fault:
                 accept = 1
             else:
-                accept = prob_g_f
+                accept = np.random.random() <= prob_g_f
         else: # selected gate is not already in the error set
-            # new = current | set(event)
             new = current | {event}
             accept = np.random.random() <= ((prob_g / (1 - prob_g)) * prob_g_f)
 
@@ -353,37 +352,121 @@ class RareEventSimulator:
         else:
             return current
 
-    def sample_failures(self, p_phys: float, num_jumps: int = 1000) -> List[Set[GateFault]]:
+    def sample_failures(self, p: float, 
+                        init_sample: Set[GateFault] = set()) -> List[Set[GateFault]]:
         """Produce samples from pi|F via MCMC (Metropolis) as in the paper.
 
         This returns a list of distinct failing events discovered by the chain.
         """
         # seed initial failing events via direct Monte Carlo (or heuristic)
-        # Simple heuristic: randomly pick sets of size ceil(d/2) until one is malignant
-        d = self.distance
-        k = math.ceil(d / 2)
-        initial = None
-        tries = 0
-        while initial is None and tries < 5000:
-            tryset = set(random.sample(self.gate_fault_list, k))
-            if self.is_malicious(tryset):
-                initial = tryset
-            tries += 1
-        if initial is None:
-            raise RuntimeError("Failed to find an initial malignant event set during setup. Try starting p_phys larger or supply seeds.")
-        chain_state = initial
-        discovered = []
-        jumps = 0
+        chain_state = init_sample
         steps = 0
-        while jumps < num_jumps and steps < self.max_steps_per_chain:
-            new_state = self.metropolis_step(chain_state, p_phys)
-            # if changed, it's a jump
-            if new_state != chain_state:
-                jumps += 1
-                discovered.append(frozenset(new_state))
-                chain_state = new_state
+
+        # Warm up chain to converge to stable distribution
+        while steps < self.num_warmup_steps:
+            new_state = self.metropolis_step(chain_state, p)
+            chain_state = new_state
             steps += 1
+
+        steps = 0
+        discovered = []
+        while steps < self.shots_per_chain:
+            new_state = self.metropolis_step(chain_state, p)
+            discovered.append(frozenset(new_state))
+            chain_state = new_state
+            steps += 1
+
+        # while jumps < num_jumps and steps < self.max_steps_per_chain:
+        #     new_state = self.metropolis_step(chain_state, p)
+        #     # if changed, it's a jump
+        #     if new_state != chain_state:
+        #         jumps += 1
+        #         discovered.append(frozenset(new_state))
+        #         chain_state = new_state
+        #     steps += 1
         return discovered
+
+    def errors_to_events(self, circuit: stim.Circuit, 
+                         dem: stim.DetectorErrorModel, errors: np.ndarray):
+        event_set: Set[GateFault] = set()
+        flat_errors = [
+            instr for instr in dem.flattened() if instr.type == "error"
+        ]
+
+        dem_filter = stim.DetectorErrorModel()
+        for error in errors:
+            dem_filter.clear()
+            dem_filter.append(flat_errors[error])
+            expl = circuit.explain_detector_error_model_errors(
+                dem_filter=dem_filter, 
+                reduce_to_one_representative_error=True
+            )[0]
+
+            index = expl.circuit_error_locations[0].stack_frames[0].instruction_offset
+            qubits = tuple([target.gate_target.value 
+                            for target in expl.circuit_error_locations[0].flipped_pauli_product])
+
+            channel = circuit[expl.circuit_error_locations[0].stack_frames[0].instruction_offset].name
+
+            gate: Gate = (index, qubits, channel)
+            fault: Fault = tuple([target.gate_target.pauli_type 
+                                  for target in expl.circuit_error_locations[0].flipped_pauli_product])
+
+            event_set.add((gate, fault))
+        
+        return event_set
+
+
+    def naive_monte_carlo(self, p: float, epsilon: float = 0.01, 
+                          alpha: float = 0.05, min_shots: int = 100000, 
+                          max_shots: int = 10_000_000):
+        def normal_ci(k, n, alpha=0.05):
+            """
+                Computes confidence interval (1 - alpha) for samples
+                generated via naive Monte Carlo sampling.
+            """
+            p = k / n # mean
+            z = norm.ppf(1 - alpha/2) # z-score
+            se = np.sqrt(p * (1 - p) / n) # standard error?
+            return np.clip(p - z * se, 0, 1), np.clip(p + z * se, 0, 1)
+        
+        logical_errors = 0
+        num_shots = 0
+
+        shots_per_sample = min_shots
+
+        noise_model = SI1000NoiseModel(p)
+        circuit: stim.Circuit = get_memory_experiment(
+            code=self.code, 
+            basis=self.basis, 
+            num_rounds=self.distance, 
+            noise_model=noise_model).flattened()
+        
+        dem = circuit.detector_error_model()
+        sampler = dem.compile_sampler()
+        
+        decoder = pymatching.Matching(circuit.detector_error_model())
+
+        failure_sample = None
+        while True:
+            dets, obs, errors = sampler.sample(shots_per_sample, return_errors=True)
+
+            preds = decoder.decode_batch(dets)
+            for shot in range(shots_per_sample):
+                if preds[shot] != obs[shot]:
+                    if failure_sample is None:
+                        failure_sample = self.errors_to_events(circuit, dem, np.flatnonzero(errors[shot]))
+                    logical_errors += 1
+            num_shots += shots_per_sample
+
+            # Compute confidence interval so far
+            low, high = normal_ci(logical_errors, num_shots)
+            halfwidth = (high-low) / 2
+
+            # If the statistical error is below a threshold,
+            # terminate the MC sampling
+            if halfwidth <= epsilon or num_shots >= max_shots:
+                return logical_errors, num_shots, failure_sample
 
     # ---------- High-level run ----------
     def run(self):
@@ -392,9 +475,40 @@ class RareEventSimulator:
         Returns a dict of results including estimated logical failure rate at
         target_p and the intermediate ratios.
         """
-        p0 = self.physical_p
+        p0 = self.p0
         pt = self.target_p
         ps = self.splitting_schedule(p0, pt)
+        logical_error_rates = []
+
+        # Naive Monte Carlo sampling at the highest physical
+        # error rate
+        logical_errors, num_shots, failure_sample = self.naive_monte_carlo(p0)
+        logical_error_rates.append(logical_errors / num_shots)
+
+        # For the remaining physical error rates, use the splitting
+        # technique
+        p_curr = p0
+        Es_num = self.sample_failures(p_curr,
+                                      init_sample=failure_sample)
+        for i in range(1, len(ps)):
+            p_next = ps[i]
+            Es_den = self.sample_failures(p_next,
+                                          init_sample=Es_num[-1])
+
+            # Estimate of logical error rate ratio
+            C = log_binary_search(Es_num, Es_den, 
+                                  lambda E: self._approx_prob_of_set(E, p_curr),
+                                  lambda E: self._approx_prob_of_set(E, p_next),
+                                  max_iters=10000)
+
+            logical_error_rates.append(C * logical_error_rates[-1])
+
+            p_curr = p_next
+            Es_num = Es_den
+
+
+        return logical_error_rates
+        '''
         ratios = []
         for i in range(len(ps) - 1):
             pi = ps[i]
@@ -472,22 +586,30 @@ class RareEventSimulator:
             'overall_ratio': overall_ratio,
             'estimated_pt': overall_ratio * p0,
         }
+        '''
 
     def _approx_prob_of_set(self, S: Set[GateFault], p: float) -> float:
         # reuse inner logic from metropolis; factorized as separate function
         prod = 1.0
-        seen_gates = set()
-        for gid2, label in S:
-            prg = self.gate_failure_prob.get(gid2, p)
-            prgf = self.gate_fault_prob.get((gid2, label), prg)
-            prod *= prg * prgf
-            seen_gates.add(gid2)
-        all_gids = set(g for g, _ in self.gate_fault_list)
-        for g in all_gids - seen_gates:
-            prg = self.gate_failure_prob.get(g, p)
-            prod *= (1 - prg)
-        return prod
 
+        failing_gates = set()
+        for event in S:
+            gate, fault = event
+            _, _, channel = gate
+
+            failing_gates.add(gate)
+
+            p_g = self.gate_failure_prob[gate] * (p / self.p0)
+            p_g_f = 1 / len(channel_faults[channel])
+
+            prod *= (p_g * p_g_f)
+        
+        nonfailing_gates = set(self.gate_list) - failing_gates
+        for g in nonfailing_gates:
+            p_g = self.gate_failure_prob[gate] * (p / self.p0)
+            prod *= (1 - p_g)
+
+        return prod
 
 # If run as a script, provide a minimal CLI
 if __name__ == '__main__':
@@ -502,8 +624,9 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    sim = RareEventSimulator(distance=args.distance, physical_p=args.p0, target_p=args.pt, 
+    sim = RareEventSimulator(distance=args.distance, p0=args.p0, target_p=args.pt, 
                              shots_per_chain=args.shots, rng_seed=args.seed)
-    # out = sim.run()
+    # lers = sim.run()
+    # print(lers)
     # import json
     # print(json.dumps(out, indent=2))
