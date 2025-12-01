@@ -93,6 +93,7 @@ EventSet = frozenset
 # Static fault lookup table
 channel_faults = {
     "Z": [("Z")],
+    "MX": [("Z")],
     "DEPOLARIZE1": [("Z"), ("X"), ("Y")],
     "IDLE": [("Z"), ("X"), ("Y")],
     "MEAS_RESET_IDLE": [("Z"), ("X"), ("Y")],
@@ -117,6 +118,7 @@ class RareEventSimulator:
     circuit: stim.Circuit = field(default=None, init=False)
     dem: stim.DetectorErrorModel = field(default=None, init=False)
     gate_list: List[Gate] = field(default_factory=list, init=False)
+    targets_to_gates: Dict[tuple, list] = field(default_factory=dict, init=False)
     gate_fault_list: List[GateFault] = field(default_factory=list, init=False)
     gate_failure_prob: Dict[Gate, float] = field(default_factory=dict, init=False)
     gate_fault_prob: Dict[GateFault, float] = field(default_factory=dict, init=False)
@@ -128,18 +130,39 @@ class RareEventSimulator:
         self.code: CSSCode = SurfaceCode(rows=self.distance, cols=self.distance, rotated=True)
         self.noise_model = SI1000NoiseModel(self.p0)
         
-        self.circuit: stim.Circuit = get_memory_experiment(
-            self.code,
-            basis=self.basis,
-            num_rounds=self.distance,
-            noise_model=self.noise_model
-        ).flattened()
+        self.circuit: stim.Circuit = self.noise_model.noisy_circuit(
+            get_memory_experiment(
+                self.code,
+                basis=self.basis,
+                num_rounds=self.distance,
+                noise_model=self.noise_model
+            ).without_noise().flattened()
+        )
+
+        # flat_errors = [
+        #     instr for instr in self.circuit.detector_error_model().flattened() if instr.type == "error"
+        # ]
+        # dem_filter = stim.DetectorErrorModel()
+        # for i, error in enumerate(flat_errors):
+        #     dem_filter.clear()
+        #     dem_filter.append(error)
+        #     expl = self.circuit.explain_detector_error_model_errors(
+        #         dem_filter=dem_filter, 
+        #         reduce_to_one_representative_error=True
+        #     )[0]
+
+        #     print(f"Error {i}:\n{expl}")
+
+        # print(self.circuit)
 
         self.decoder = pymatching.Matching(
             self.circuit.detector_error_model(decompose_errors=True)
         )
 
         self._catalog_gate_faults()
+        
+        # for gate in self.gate_list:
+        #     print(f"Gate: {gate}")
         
         # Create all possible (gate, fault) combinations
         self.gate_fault_list = []
@@ -166,12 +189,15 @@ class RareEventSimulator:
         """
         active_qubits: set[int] = set()
         measure_or_reset_in_moment = False
+        tick_offset = 0
 
         instr: stim.CircuitInstruction
         for (i, instr) in enumerate(self.circuit.without_noise().flattened()):
             # A TICK instruction indicates a new "moment" (timeslice) in the quantum circuit
             # so we need to re-evaluate the sets of active and idle qubits
+            index = i
             if instr.name == "TICK":
+                tick_offset += 1
                 # Calculate idle qubits
                 qubit_ids = QubitIDs.from_code(self.code)
                 all_qubits = set(qubit_ids.data + qubit_ids.check)
@@ -226,6 +252,7 @@ class RareEventSimulator:
                         gate_channel = "Z" if self.basis == Pauli.X else "X"
                         measure_or_reset_in_moment = True
                     elif noise_rule.readout_error != 0:
+                        index = i - 1 # noise for measurements goes before the measurement
                         gate_prob = noise_rule.readout_error
                         gate_channel = "Z" if self.basis == Pauli.X else "X"
                         measure_or_reset_in_moment = True
@@ -238,8 +265,11 @@ class RareEventSimulator:
                             gate_prob = prob[0]
                             gate_channel = channel
                     
-                    gate: Gate = (i, gate_targets, gate_channel)
+
+                    gate: Gate = (index, gate_targets, gate_channel)
                     self.gate_list.append(gate)
+                    # Keeps track of different offsets/gate indices at which gate_targets can be found
+                    self.targets_to_gates.setdefault(gate_targets, []).append((tick_offset, index))
                     self.gate_failure_prob[gate] = gate_prob
 
     # ---------- Core algorithm pieces ----------
@@ -259,6 +289,10 @@ class RareEventSimulator:
             pn = pi * factor
             ps.append(pn)
 
+        # Avoid undershooting target physical error rate
+        if ps[-1] < pt:
+            ps[-1] = pt
+        
         return ps
 
     def inject_events(self, event_set: Set[GateFault]) -> stim.Circuit:
@@ -394,28 +428,65 @@ class RareEventSimulator:
         ]
 
         dem_filter = stim.DetectorErrorModel()
-        for error in errors:
+        for e in errors:
+            error = flat_errors[e]
             dem_filter.clear()
-            dem_filter.append(flat_errors[error])
+            dem_filter.append(error)
             expl = circuit.explain_detector_error_model_errors(
                 dem_filter=dem_filter, 
                 reduce_to_one_representative_error=True
             )[0]
 
-            index = expl.circuit_error_locations[0].stack_frames[0].instruction_offset
-            qubits = tuple([target.gate_target.value 
-                            for target in expl.circuit_error_locations[0].flipped_pauli_product])
+            loc: stim.CircuitErrorLocation = expl.circuit_error_locations[0]
+            frame: stim.CircuitErrorLocationStackFrame = loc.stack_frames[0]
+            
+            qubits = [target.gate_target.value for target in 
+                            loc.instruction_targets.targets_in_range]
 
-            channel = circuit[expl.circuit_error_locations[0].stack_frames[0].instruction_offset].name
+            flipped_qubits = []
+            flips = []
+            if len(loc.flipped_pauli_product) != 0:
+                flipped_qubits = [target.gate_target.value for target in loc.flipped_pauli_product]
+                flips = [target.gate_target.pauli_type for target in
+                                    loc.flipped_pauli_product]
+            else:
+                flipped_qubits = [target.gate_target.value for target in loc.flipped_measurement.observable]
+                for target in loc.flipped_measurement.observable:
+                    if target.gate_target.pauli_type in ["Z", "Y"]:
+                        flips.append("X")
+                    else:
+                        flips.append("Z")
+            
+            faults = []
+            for qubit in qubits:
+                if qubit in flipped_qubits:
+                    faults.append(
+                        flips[flipped_qubits.index(qubit)]
+                    )
+                else:
+                    faults.append("I")
+            
+            channel = "Z" if circuit[frame.instruction_offset].name == "MX" \
+                        else circuit[frame.instruction_offset].name.strip("_ERROR")
 
-            gate: Gate = (index, qubits, channel)
-            fault: Fault = tuple([target.gate_target.pauli_type 
-                                  for target in expl.circuit_error_locations[0].flipped_pauli_product])
+            tick_offsets, gate_indices = zip(*self.targets_to_gates[tuple(qubits)])
 
-            event_set.add((gate, fault))
+            # A bit hacky, but since instruction indices get offset when adding
+            # in noise channels, we need a way to go from the noise channel indices
+            # in the Stim circuit to the gate indices in our RES. To do so, we've kept
+            # a record of all tick offsets and gate indices at which a particular set of 
+            # gate targets can be found. Then, using the noise channel tick offset, we 
+            # choose the gate index for the given set of gate targets whose tick offset 
+            # matches that of the noise channel tick offset
+            for i, tick_offset in enumerate(tick_offsets):
+                if tick_offset == loc.tick_offset:
+                    index = gate_indices[i]
+                    break
+            
+            gate: Gate = (index, tuple(qubits), channel)
+            event_set.add((gate, tuple(faults)))
         
         return event_set
-
 
     def naive_monte_carlo(self, p: float, epsilon: float = 0.01, 
                           alpha: float = 0.05, min_shots: int = 100000, 
@@ -436,11 +507,14 @@ class RareEventSimulator:
         shots_per_sample = min_shots
 
         noise_model = SI1000NoiseModel(p)
-        circuit: stim.Circuit = get_memory_experiment(
-            code=self.code, 
-            basis=self.basis, 
-            num_rounds=self.distance, 
-            noise_model=noise_model).flattened()
+        circuit: stim.Circuit = noise_model.noisy_circuit(
+            get_memory_experiment(
+                self.code,
+                basis=self.basis,
+                num_rounds=self.distance,
+                noise_model=noise_model
+            ).without_noise().flattened()
+        )
         
         dem = circuit.detector_error_model()
         sampler = dem.compile_sampler()
@@ -482,8 +556,8 @@ class RareEventSimulator:
 
         # Naive Monte Carlo sampling at the highest physical
         # error rate
-        logical_errors, num_shots, failure_sample = self.naive_monte_carlo(p0)
-        logical_error_rates.append(logical_errors / num_shots)
+        num_logical_errors, num_shots, failure_sample = self.naive_monte_carlo(p0)
+        logical_error_rates.append(num_logical_errors / num_shots)
 
         # For the remaining physical error rates, use the splitting
         # technique
@@ -507,7 +581,7 @@ class RareEventSimulator:
             Es_num = Es_den
 
 
-        return logical_error_rates
+        return logical_error_rates, ps
         '''
         ratios = []
         for i in range(len(ps) - 1):
@@ -626,7 +700,11 @@ if __name__ == '__main__':
 
     sim = RareEventSimulator(distance=args.distance, p0=args.p0, target_p=args.pt, 
                              shots_per_chain=args.shots, rng_seed=args.seed)
-    # lers = sim.run()
-    # print(lers)
+    
+    print("RARE EVENT SIMULATOR\n===========")
+    results = sim.run()
+    for (l, p) in list(zip(*results)):
+        print(f"Physical Error Rate: {p} -> Logical Error Rate: {l}")
+
     # import json
     # print(json.dumps(out, indent=2))

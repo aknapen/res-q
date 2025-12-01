@@ -368,6 +368,88 @@ class TestRareEventSimulator(unittest.TestCase):
 
         self.assertFalse(logical_error)
 
+    def test_errors_to_events_reset(self):
+        d = 3
+        sim = RareEventSimulator(
+            distance=d,
+            target_p=1E-4,
+            basis=Pauli.X
+        )
+
+        '''
+            Error 1:
+            ExplainedError {
+                dem_error_terms: D0[coords 0,0,0] D2[coords 0,0,2]
+                CircuitErrorLocation {
+                    flipped_pauli_product: Z3[coords 0,3]
+                    Circuit location stack trace:
+                        (after 0 TICKs)
+                        at instruction #19 (Z_ERROR) in the circuit
+                        at target #4 of the instruction
+                        resolving to Z_ERROR(0.002) 3[coords 0,3]
+                }
+            } 
+            Expected Event Set: Gate: (17, (3,), 'Z'), Fault: ('Z',)
+        '''
+        expected_events = {((17, (3,), 'Z'), ('Z',))}
+        events = sim.errors_to_events(sim.circuit, sim.circuit.detector_error_model(), [1])
+        self.assertEqual(expected_events, events)
+    
+    def test_errors_to_events_meas(self):
+        d = 3
+        sim = RareEventSimulator(
+            distance=d,
+            target_p=1E-4,
+            basis=Pauli.X
+        )
+
+        '''
+            Error 3:
+            ExplainedError {
+                dem_error_terms: D0[coords 0,0,0] D4[coords 1,0,0]
+                CircuitErrorLocation {
+                    flipped_measurement.measurement_record_index: 0
+                    flipped_measurement.measured_observable: X9[coords 1,0]
+                    Circuit location stack trace:
+                        (after 5 TICKs)
+                        at instruction #41 (MX) in the circuit
+                        at target #1 of the instruction
+                        resolving to MX(0.005) 9[coords 1,0]
+                }
+            }
+            Expected Event Set: Gate: (30, (9,), 'Z'), Fault: ('Z',)
+        '''
+        expected_events = {((30, (9,), 'Z'), ('Z',))}
+        events = sim.errors_to_events(sim.circuit, sim.circuit.detector_error_model(), [3])
+        self.assertEqual(expected_events, events)
+    
+    def test_errors_to_events_2q(self):
+        d = 3
+        sim = RareEventSimulator(
+            distance=d,
+            target_p=1E-4,
+            basis=Pauli.X
+        )
+
+        '''
+            Error 4:
+            ExplainedError {
+                dem_error_terms: D0[coords 0,0,0] D6[coords 1,0,2]
+                CircuitErrorLocation {
+                    flipped_pauli_product: Z3[coords 0,3]
+                    Circuit location stack trace:
+                        (after 2 TICKs)
+                        at instruction #28 (DEPOLARIZE2) in the circuit
+                        at targets #3 to #4 of the instruction
+                        resolving to DEPOLARIZE2(0.001) 11[coords 1,2] 3[coords 0,3]
+                }
+            }
+            Expected Event Set: Gate: (22, (11, 3), 'DEPOLARIZE2'), Fault: ('I','Z')
+        '''
+        expected_events = {((22, (11, 3), 'DEPOLARIZE2'), ('I', 'Z'))}
+        events = sim.errors_to_events(sim.circuit, sim.circuit.detector_error_model(), [4])
+        self.assertEqual(expected_events, events)
+
     # def test(self):
     #     d = 5
     #     sim = RareEventSimulator(
