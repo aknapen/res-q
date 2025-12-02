@@ -1,29 +1,30 @@
 import numpy as np
+from time import time
 
 def g(x):
     return 1.0 / (1.0 + x)
 
-def log_binary_search(Es_num, Es_den, prob_func_curr, prob_func_next, 
+def log_binary_search(Es_num, Es_den, prob_ratio, prob_ratio_inv, 
                       tolerance=1e-9, max_iters=100) -> float:
     '''
         Performs a binary search to find a constant satisfying Eq. (4) in
         https://arxiv.org/pdf/2509.13678
 
-        prob_func_curr := p_i(E)
-        prob_func_next := p_i+1(E)
+        prob_ratio computes π_i(E) / π_i+1(E)
+        prob_func_inv computes π_i+1(E) / π_i(E)
     '''
-    # precompute probability ratios
+    # Precompute probability ratios
 
     # Numerator expected value has term: π_i(E) / π_i+1(E)
-    probs_num = [prob_func_curr(E) / prob_func_next(E) for E in Es_num]
+    probs_num = [prob_ratio(E) for E in Es_num]
 
     # Denominator expected value has term: π_i+1(E) / π_i(E)
-    probs_den = [prob_func_next(E) / prob_func_curr(E) for E in Es_den] 
-
+    probs_den = [prob_ratio_inv(E) for E in Es_num]
+    
+    # Search for C
     log_C_min = np.log(1E-10)
-    log_C_max = np.log(1E10) 
+    log_C_max = np.log(10) 
     for i in range(max_iters):
-        # Guess C at midpoint of current search interval
         log_C = (log_C_min + log_C_max) / 2.0
         C = np.exp(log_C)
 

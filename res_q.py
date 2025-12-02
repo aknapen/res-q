@@ -1,13 +1,12 @@
-import stim
 import numpy as np
 from scipy.stats import norm
-
-from util import log_binary_search
+from time import time 
+import json
 
 from dataclasses import dataclass, field
 import math
 import random
-from typing import List, Tuple, Set, Dict, Optional, Any
+from typing import List, Tuple, Set, Dict, Optional
 
 import stim
 import pymatching
@@ -17,6 +16,8 @@ from qldpc.objects import Pauli, PauliXZ
 from qldpc.circuits import get_memory_experiment
 from qldpc.codes.quantum import CSSCode, SurfaceCode
 from qldpc.circuits.bookkeeping import QubitIDs
+
+from util import log_binary_search
 
 """
 Rare-event splitting simulator for Stim circuits
@@ -110,23 +111,26 @@ class RareEventSimulator:
     p0: float = 1e-3  # starting p for MC setup
     target_p: float = 1e-9
     jumps_per_chain: int = 200  # N in the paper for expectation estimates
-    rng_seed: Optional[int] = None
     num_warmup_steps: int = 10000
     basis: PauliXZ = Pauli.X
 
     # internal fields
     circuit: stim.Circuit = field(default=None, init=False)
     dem: stim.DetectorErrorModel = field(default=None, init=False)
+    # List of all unique gates in the circuit
     gate_list: List[Gate] = field(default_factory=list, init=False)
+    # Mapping from a group of qubits to all the gates that act on that group of qubits
     targets_to_gates: Dict[tuple, list] = field(default_factory=dict, init=False)
-    gate_fault_list: List[GateFault] = field(default_factory=list, init=False)
+    # Mapping from a gate to the probability that it can fail for any reason
     gate_failure_prob: Dict[Gate, float] = field(default_factory=dict, init=False)
+    # Mapping from a (gate, fault) pair to the conditional probability that, given
+    # the gate failed, it failed with that particular fault
     gate_fault_prob: Dict[GateFault, float] = field(default_factory=dict, init=False)
+    # Mapping from a S, a set of (gate, fault) pairs, and two physical error rates, p1 and p2,
+    # to the ratio Pr(S @ p1) / Pr(S @ p2)
+    event_set_prob: Dict[Tuple[Set[GateFault], float, float], float] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
-        if self.rng_seed is not None:
-            random.seed(self.rng_seed)
-
         self.code: CSSCode = SurfaceCode(rows=self.distance, cols=self.distance, rotated=True)
         self.noise_model = SI1000NoiseModel(self.p0)
         
@@ -139,47 +143,26 @@ class RareEventSimulator:
             ).without_noise().flattened()
         )
 
-        # flat_errors = [
-        #     instr for instr in self.circuit.detector_error_model().flattened() if instr.type == "error"
-        # ]
-        # dem_filter = stim.DetectorErrorModel()
-        # for i, error in enumerate(flat_errors):
-        #     dem_filter.clear()
-        #     dem_filter.append(error)
-        #     expl = self.circuit.explain_detector_error_model_errors(
-        #         dem_filter=dem_filter, 
-        #         reduce_to_one_representative_error=True
-        #     )[0]
-
-        #     print(f"Error {i}:\n{expl}")
-
-        # print(self.circuit)
-
         self.decoder = pymatching.Matching(
-            self.circuit.detector_error_model(decompose_errors=True)
+            self.circuit.detector_error_model()
         )
 
         self._catalog_gate_faults()
         
-        # for gate in self.gate_list:
-        #     print(f"Gate: {gate}")
-
-        # Create all possible (gate, fault) combinations
-        self.gate_fault_list = []
-        for gate in self.gate_list:
-            (_, _, channel) = gate
-            for fault in channel_faults[channel]:
-                self.gate_fault_list.append((gate, fault))
-                
         # Create conditional fault probabilities: P(fault | gate failed)
         self.gate_fault_prob = {}
-        for gate_fault in self.gate_fault_list:
-            gate, fault = gate_fault
+        for gate in self.gate_list:
             (_, _, channel) = gate
-            # Uniform distribution over possible faults for this channel
             prob_fault_given_failure = 1.0 / len(channel_faults[channel])
-            self.gate_fault_prob[gate_fault] = prob_fault_given_failure
 
+            # For each possible fault for that gate, store the conditional
+            # probability
+            for fault in channel_faults:
+                self.gate_fault_prob[(gate, fault)] = prob_fault_given_failure
+            
+        # For use in memoization for _event_set_prob_ratio()
+        self.event_set_prob = {}
+        
     def _catalog_gate_faults(self):
         """Catalog all possible failing gates in a Stim circuit.
 
@@ -347,9 +330,6 @@ class RareEventSimulator:
         """
         # pick a gate uniformly among catalog and a fault uniformly at random
         # for that gate
-        gate_fault: GateFault = random.choice(self.gate_fault_list)
-        gate, _ = gate_fault
-
         gate: Gate = random.choice(self.gate_list)
         (_, _, channel) = gate
         fault: Fault = random.choice(channel_faults[channel])
@@ -578,6 +558,8 @@ class RareEventSimulator:
         Returns a dict of results including estimated logical failure rate at
         target_p and the intermediate ratios.
         """
+        results = {}
+
         p0 = self.p0
         pt = self.target_p
         ps = self.splitting_schedule(p0, pt)
@@ -585,60 +567,95 @@ class RareEventSimulator:
 
         # Naive Monte Carlo sampling at the highest physical
         # error rate
+        start = time()
         num_logical_errors, num_shots, failure_sample = self.naive_monte_carlo(p0)
+        end = time()
+
+        results["timing"] = {"monte-carlo": end - start }
+
         logical_error_rates.append(num_logical_errors / num_shots)
 
         # For the remaining physical error rates, use the splitting
         # technique
         p_curr = p0
+        start = time()
         Es_num = self.sample_failures(p_curr,
                                       init_sample=failure_sample)
-            
+        end = time()
+
+        results["timing"] = {}
+        results["timing"]["markov-chain"] = [end - start]
+        results["timing"]["binary-search"] = []
+        results["C"] = []
+
         for i in range(1, len(ps)):
             p_next = ps[i]
+
+            start = time()
             Es_den = self.sample_failures(p_next,
                                           init_sample=Es_num[-1])
-            
+            end = time()
+
+            results["timing"]["markov-chain"].append(end-start)
+
+            start = time()
             # Estimate of logical error rate ratio
             C = log_binary_search(Es_num, Es_den, 
-                                  lambda E: self._approx_prob_of_set(E, p_curr),
-                                  lambda E: self._approx_prob_of_set(E, p_next),
+                                  lambda E: self._event_set_prob_ratio(E, p_curr, p_next),
+                                  lambda E: self._event_set_prob_ratio(E, p_next, p_curr),
                                   max_iters=10000)
-            print(f"Calculated C for p={p_next}: {C}")
+            end = time()
+            
+            results["timing"]["binary-search"].append(end-start)
+            results["C"].append(C)
 
             logical_error_rates.append(C * logical_error_rates[-1])
 
             p_curr = p_next
             Es_num = Es_den
 
-        return logical_error_rates, ps
+        results["physical-error-rates"] = ps
+        results["logical-error-rates"] = logical_error_rates
 
-    def _approx_prob_of_set(self, S: Set[GateFault], p: float) -> float:
-        '''Calculates the probability of occurence of a given set of gate, fault pairs'''
+        return results
 
-        # reuse inner logic from metropolis; factorized as separate function
-        prod = 1.0
+    def _event_set_prob_ratio(self, S: Set[GateFault], p1: float, p2: float) -> float:
+        '''
+            Computes the ratio of the occurrence probability for a set S of (gate, fault) pairs
+            at two different physical error rates, p1 and p2. The occurrence probability for the
+            set S is calculated as the product of (1) the probability that the gates in S failed
+            and (2) the probability that the gates not in S didn't fail.
 
-        failing_gates = set()
-        # Accumulate the probabilties that the failing gates would
-        # have failed
-        for event in S:
-            gate, _ = event
-            _, _, channel = gate
-
-            failing_gates.add(gate)
-
-            p_g = self.gate_failure_prob[gate] * (p / self.p0)
-            p_g_f = 1 / len(channel_faults[channel])
-
-            prod *= (p_g * p_g_f)
+            This function uses two tricks to speed up execution. First, since we're computing ratios,
+            the ratio of the probabilities of each gate in S failing reduces to (p1 / p2)^N where N
+            is the number of failing gates. Second, and much more significantly, since many steps in
+            the Markov chain don't actually alter the chain state, there will be many repeated sets 
+            of (gate, fault) pairs. Hence, we use memoization to store results for a given set S and
+            physical error rates p1 and p2 and attempt to look up the result before trying to do the
+            full computation.
+        '''
         
-        # Now include the probabilities that the other gates in the
+        prob = self.event_set_prob.get((S, p1, p2))
+        if prob is not None:
+            return prob
+
+        prod = 1.0
+        r1 = p1 / self.p0
+        r2 = p2 / self.p0
+
+        # (1) Accumulate the probabilties that the failing gates would
+        # have failed
+        prod *= (r1 / r2) ** len(S)
+        
+        # (2) Accumulate the probabilities that the other gates in the
         # circuit didn't fail
-        nonfailing_gates = set(self.gate_list) - failing_gates
+        nonfailing_gates = set(self.gate_list) - set(gate for gate, _ in S)
         for gate in nonfailing_gates:
-            p_g = self.gate_failure_prob[gate] * (p / self.p0)
-            prod *= (1 - p_g)
+            pg = self.gate_failure_prob[gate]
+            prod *= (1 - (pg * r1)) / (1 - (pg * r2))
+
+        # Store the computed result for lookup in subsequent calls
+        self.event_set_prob[(S, p1, p2)] = prod
 
         return prod
 
@@ -656,12 +673,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     sim = RareEventSimulator(distance=args.distance, p0=args.p0, target_p=args.pt, 
-                             jumps_per_chain=args.shots, rng_seed=args.seed)
+                             jumps_per_chain=args.shots)
     
-    print("RARE EVENT SIMULATOR\n===========")
     results = sim.run()
-    for (l, p) in list(zip(*results)):
-        print(f"Physical Error Rate: {p} -> Logical Error Rate: {l}")
 
-    # import json
-    # print(json.dumps(out, indent=2))
+    with open(f"d={args.distance}.json", "w") as f:
+        json.dump(results, f, indent=4)
