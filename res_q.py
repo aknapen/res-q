@@ -92,11 +92,11 @@ EventSet = frozenset
 
 # Static fault lookup table
 channel_faults = {
-    "Z": [("Z")],
-    "MX": [("Z")],
-    "DEPOLARIZE1": [("Z"), ("X"), ("Y")],
-    "IDLE": [("Z"), ("X"), ("Y")],
-    "MEAS_RESET_IDLE": [("Z"), ("X"), ("Y")],
+    "Z": [("Z",)],
+    "MX": [("Z",)],
+    "DEPOLARIZE1": [("Z",), ("X",), ("Y",)],
+    "IDLE": [("Z",), ("X",), ("Y",)],
+    "MEAS_RESET_IDLE": [("Z",), ("X",), ("Y",)],
     "DEPOLARIZE2": [("I","X"), ("I","Y"), ("I","Z"), 
                     ("X","X"), ("X","Y"), ("X","Z"), 
                     ("Y","X"), ("Y","Y"), ("Y","Z"), 
@@ -109,9 +109,9 @@ class RareEventSimulator:
     distance: int = 3
     p0: float = 1e-3  # starting p for MC setup
     target_p: float = 1e-9
-    shots_per_chain: int = 200  # N in the paper for expectation estimates
+    jumps_per_chain: int = 200  # N in the paper for expectation estimates
     rng_seed: Optional[int] = None
-    num_warmup_steps: int = 1000
+    num_warmup_steps: int = 10000
     basis: PauliXZ = Pauli.X
 
     # internal fields
@@ -163,7 +163,7 @@ class RareEventSimulator:
         
         # for gate in self.gate_list:
         #     print(f"Gate: {gate}")
-        
+
         # Create all possible (gate, fault) combinations
         self.gate_fault_list = []
         for gate in self.gate_list:
@@ -311,12 +311,11 @@ class RareEventSimulator:
         for event in event_list:
             (gate, fault) = event
             (gate_index, qubits, _) = gate
-            # for i, f in enumerate(f):
+
             for i, f in enumerate(fault):
                 if f != "I":
                     target_circuit.insert(
                         gate_index+1+index_offset, 
-                        # stim.CircuitInstruction(fault+"_ERROR", [qubits[i]], [1.0])
                         stim.CircuitInstruction(f+"_ERROR", [qubits[i]], [1.0])
                     )
                     index_offset += 1
@@ -341,22 +340,20 @@ class RareEventSimulator:
 
         return pred != obs[0]
 
-    def metropolis_step(self, current: Set[GateFault], p: float) -> Set[GateFault]:
+    def metropolis_step(self, current: Set[GateFault], p: float) -> Set[GateFault] | None:
         """Perform one Metropolis step modifying a single gate's fault as in paper.
 
-        Returns the new set (may be the same as current if rejected).
+        Returns the new set (or None if rejected).
         """
         # pick a gate uniformly among catalog and a fault uniformly at random
         # for that gate
-        # gate: Gate = random.choice(self.gate_fault_list)
-
         gate_fault: GateFault = random.choice(self.gate_fault_list)
         gate, _ = gate_fault
 
         gate: Gate = random.choice(self.gate_list)
         (_, _, channel) = gate
         fault: Fault = random.choice(channel_faults[channel])
-
+        
         # Probability that the gate would have failed
         prob_g = self.gate_failure_prob[gate] * (p / self.p0)
         # Probability that, given the gate has failed, 
@@ -369,22 +366,34 @@ class RareEventSimulator:
         if gate in current_gates: # selected gate is already in error set
             # find the (gate, fault) currently in the error set
             current_event: GateFault = next((e for e in current if e[0] == gate), None)
+            
+            # Add in the new gate, fault pair and remove the already existing 
+            # pair with the same gate (may remove the gate, fault pair entirely
+            # if the already existing pair has the same fault as the one being added)
             new = (current | {event}) - {current_event}
-
+            
             (_, current_fault) = current_event
+
+            # If the gate, fault pair was entirely removed, always accept the change
             if fault == current_fault:
+                acceptance_probability = 1
                 accept = 1
             else:
-                accept = np.random.random() <= prob_g_f
+                acceptance_probability = prob_g_f
+                accept = np.random.random() <= acceptance_probability
+
         else: # selected gate is not already in the error set
             new = current | {event}
-            accept = np.random.random() <= ((prob_g / (1 - prob_g)) * prob_g_f)
+
+            acceptance_probability = ((prob_g / (1 - prob_g)) * prob_g_f)
+
+        accept = np.random.random() <= acceptance_probability
 
         # Only consider acceptance if new causes a logical failure
-        if self.is_malicious(new) and accept:
+        if accept and self.is_malicious(new):    
             return new
         else:
-            return current
+            return None
 
     def sample_failures(self, p: float, 
                         init_sample: Set[GateFault] = set()) -> List[Set[GateFault]]:
@@ -394,39 +403,40 @@ class RareEventSimulator:
         """
         # seed initial failing events via direct Monte Carlo (or heuristic)
         chain_state = init_sample
-        steps = 0
-
+        
+        num_steps = 0
         # Warm up chain to converge to stable distribution
-        while steps < self.num_warmup_steps:
+        while num_steps < self.num_warmup_steps:
             new_state = self.metropolis_step(chain_state, p)
-            chain_state = new_state
-            steps += 1
+            if new_state is not None:
+                chain_state = new_state
+            num_steps += 1
 
-        steps = 0
+        # Keep extending the chain until a threshold number
+        # of state changes occurs
+        num_jumps = 0
         discovered = []
-        while steps < self.shots_per_chain:
+        while num_jumps < self.jumps_per_chain:
             new_state = self.metropolis_step(chain_state, p)
-            discovered.append(frozenset(new_state))
-            chain_state = new_state
-            steps += 1
+            if new_state is not None:
+                chain_state = new_state
+                num_jumps += 1
+            discovered.append(frozenset(chain_state))
 
-        # while jumps < num_jumps and steps < self.max_steps_per_chain:
-        #     new_state = self.metropolis_step(chain_state, p)
-        #     # if changed, it's a jump
-        #     if new_state != chain_state:
-        #         jumps += 1
-        #         discovered.append(frozenset(new_state))
-        #         chain_state = new_state
-        #     steps += 1
         return discovered
 
     def errors_to_events(self, circuit: stim.Circuit, 
-                         dem: stim.DetectorErrorModel, errors: np.ndarray):
+                         dem: stim.DetectorErrorModel,
+                         errors: np.ndarray) -> Set[GateFault]:
+        ''' Translates an array of Stim errors into a set of (gate, fault) pairs.'''
+
         event_set: Set[GateFault] = set()
         flat_errors = [
             instr for instr in dem.flattened() if instr.type == "error"
         ]
 
+        # Loop through all triggered errors in the DEM and parse corresponding
+        # circuit-level information (e.g., flipped qubits, time of the error)
         dem_filter = stim.DetectorErrorModel()
         for e in errors:
             error = flat_errors[e]
@@ -443,15 +453,24 @@ class RareEventSimulator:
             qubits = [target.gate_target.value for target in 
                             loc.instruction_targets.targets_in_range]
 
+            
+            # Determine which qubits experienced Pauli errors and what types
+            # of Pauli errors
             flipped_qubits = []
             flips = []
+            # Flip of a qubit
             if len(loc.flipped_pauli_product) != 0:
-                flipped_qubits = [target.gate_target.value for target in loc.flipped_pauli_product]
+                flipped_qubits = [target.gate_target.value 
+                                  for target in loc.flipped_pauli_product]
                 flips = [target.gate_target.pauli_type for target in
                                     loc.flipped_pauli_product]
+            # Flip of a measurement value
             else:
-                flipped_qubits = [target.gate_target.value for target in loc.flipped_measurement.observable]
+                flipped_qubits = [target.gate_target.value 
+                                  for target in loc.flipped_measurement.observable]
+                
                 for target in loc.flipped_measurement.observable:
+                    # Pauli flip is the opposite of the measurement basis
                     if target.gate_target.pauli_type in ["Z", "Y"]:
                         flips.append("X")
                     else:
@@ -466,9 +485,13 @@ class RareEventSimulator:
                 else:
                     faults.append("I")
             
-            channel = "Z" if circuit[frame.instruction_offset].name == "MX" \
-                        else circuit[frame.instruction_offset].name.strip("_ERROR")
-
+            channel = circuit[frame.instruction_offset].name.strip("_ERROR")
+            # Measurement error channel Pauli type is opposite of measurement basis
+            if circuit[frame.instruction_offset].name == "MX":
+                channel = "Z"
+            elif circuit[frame.instruction_offset].name == "M":
+                channel = "X"
+            
             tick_offsets, gate_indices = zip(*self.targets_to_gates[tuple(qubits)])
 
             # A bit hacky, but since instruction indices get offset when adding
@@ -528,9 +551,15 @@ class RareEventSimulator:
             preds = decoder.decode_batch(dets)
             for shot in range(shots_per_sample):
                 if preds[shot] != obs[shot]:
-                    if failure_sample is None:
-                        failure_sample = self.errors_to_events(circuit, dem, np.flatnonzero(errors[shot]))
                     logical_errors += 1
+
+                    # Record a failure sample to initialize the first
+                    # Markov chain
+                    if failure_sample is None:
+                        failure_sample = self.errors_to_events(circuit, 
+                                                               dem, 
+                                                               np.flatnonzero(errors[shot]))
+                    
             num_shots += shots_per_sample
 
             # Compute confidence interval so far
@@ -564,111 +593,37 @@ class RareEventSimulator:
         p_curr = p0
         Es_num = self.sample_failures(p_curr,
                                       init_sample=failure_sample)
+            
         for i in range(1, len(ps)):
             p_next = ps[i]
             Es_den = self.sample_failures(p_next,
                                           init_sample=Es_num[-1])
-
+            
             # Estimate of logical error rate ratio
             C = log_binary_search(Es_num, Es_den, 
                                   lambda E: self._approx_prob_of_set(E, p_curr),
                                   lambda E: self._approx_prob_of_set(E, p_next),
                                   max_iters=10000)
+            print(f"Calculated C for p={p_next}: {C}")
 
             logical_error_rates.append(C * logical_error_rates[-1])
 
             p_curr = p_next
             Es_num = Es_den
 
-
         return logical_error_rates, ps
-        '''
-        ratios = []
-        for i in range(len(ps) - 1):
-            pi = ps[i]
-            pin = ps[i + 1]
-            # produce samples from pi|F via MCMC
-            E_num = self.sample_failures(pi, num_jumps=self.shots_per_chain)
-            
-            E_den = self.sample_failures(pin, num_jumps=self.shots_per_chain)
-            
-            def pi_j_func(E):
-                return self._approx_prob_of_set(E, pi)
-            
-            def pi_j_plus_1_func(E):
-                return self._approx_prob_of_set(E, pin)
-            
-            C = log_binary_search(
-                E_num,  # samples from π_i|F
-                E_den,  # samples from π_{i+1|F}
-                lambda E: self._approx_prob_of_set(E, pi),     # π_i(E)
-                lambda E: self._approx_prob_of_set(E, pin),    # π_{i+1}(E)
-                tolerance=1e-9,
-                max_iter=100
-            )
-            ratio = C  # Use C as the ratio estimate
-            ratios.append(ratio)
-            
-            
-            
-            # # Search for a value C which expectation at i == expectation at i+1
-            # C = log_binary_search(
-            #     E_num, 
-            #     E_den,
-            #     pi_j_func, 
-            #     pi_j_plus_1_func,
-            #     tolerance=1e-9,
-            #     max_iter=100
-            # )
-        
-        
-            # # estimate ratio using Bennett-type estimator (g(x) = 1/(1+x))
-            # # compute weights w_j = g(C*pi(E)/pi+1(E)) and choose C satisfying eq (4)
-            # # For simplicity we search for C by binary search on log-space
-            # def estimate_ratio(C: float) -> float:
-            #     vals_i = []
-            #     vals_in = []
-            #     for s in samples:
-            #         # compute pi(E) and pi+1(E) approximately via prob_of_set
-            #         # reuse approx prob_of_set defined locally
-            #         piE = self._approx_prob_of_set(s, pi)
-            #         pinE = self._approx_prob_of_set(s, pin)
-            #         if piE == 0 or pinE == 0:
-            #             continue
-            #         x = C * (piE / pinE)
-            #         vals_i.append(1.0 / (1.0 + x))
-            #     # Similarly we would need samples from pi+1|F; to avoid a nested MCMC
-            #     # we use the approximation that samples are similar and estimate the ratio
-            #     # using the average of the above as a heuristic. A fully correct
-            #     # implementation requires generating samples at pi+1 as well.
-            #     if not vals_i:
-            #         return 1.0
-            #     return sum(vals_i) / len(vals_i)
-
-            # C_est = 1.0
-            # ratio = pin / pi  # placeholder; full method requires solving eq (4)
-            # ratios.append(ratio)
-        # multiply ratios to get final
-        overall_ratio = 1.0
-        for r in ratios:
-            overall_ratio *= r
-        # initial logical rate estimate at p0 via naive Monte Carlo
-        # For simplicity return placeholder estimates
-        return {
-            'ps': ps,
-            'ratios': ratios,
-            'overall_ratio': overall_ratio,
-            'estimated_pt': overall_ratio * p0,
-        }
-        '''
 
     def _approx_prob_of_set(self, S: Set[GateFault], p: float) -> float:
+        '''Calculates the probability of occurence of a given set of gate, fault pairs'''
+
         # reuse inner logic from metropolis; factorized as separate function
         prod = 1.0
 
         failing_gates = set()
+        # Accumulate the probabilties that the failing gates would
+        # have failed
         for event in S:
-            gate, fault = event
+            gate, _ = event
             _, _, channel = gate
 
             failing_gates.add(gate)
@@ -678,8 +633,10 @@ class RareEventSimulator:
 
             prod *= (p_g * p_g_f)
         
+        # Now include the probabilities that the other gates in the
+        # circuit didn't fail
         nonfailing_gates = set(self.gate_list) - failing_gates
-        for g in nonfailing_gates:
+        for gate in nonfailing_gates:
             p_g = self.gate_failure_prob[gate] * (p / self.p0)
             prod *= (1 - p_g)
 
@@ -699,7 +656,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     sim = RareEventSimulator(distance=args.distance, p0=args.p0, target_p=args.pt, 
-                             shots_per_chain=args.shots, rng_seed=args.seed)
+                             jumps_per_chain=args.shots, rng_seed=args.seed)
     
     print("RARE EVENT SIMULATOR\n===========")
     results = sim.run()
