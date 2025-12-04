@@ -542,13 +542,9 @@ class RareEventSimulator:
                     
             num_shots += shots_per_sample
 
-            # Compute confidence interval so far
-            low, high = normal_ci(logical_errors, num_shots)
-            halfwidth = (high-low) / 2
-
             # If the statistical error is below a threshold,
             # terminate the MC sampling
-            if halfwidth <= epsilon or num_shots >= max_shots:
+            if logical_errors > 100 or num_shots >= max_shots:
                 return logical_errors, num_shots, failure_sample
 
     # ---------- High-level run ----------
@@ -559,7 +555,9 @@ class RareEventSimulator:
         target_p and the intermediate ratios.
         """
         results = {}
+        results["timing"] = {}
 
+        total_start = time()
         p0 = self.p0
         pt = self.target_p
         ps = self.splitting_schedule(p0, pt)
@@ -571,7 +569,7 @@ class RareEventSimulator:
         num_logical_errors, num_shots, failure_sample = self.naive_monte_carlo(p0)
         end = time()
 
-        results["timing"] = {"monte-carlo": end - start }
+        results["timing"]["monte-carlo"] = end - start
 
         logical_error_rates.append(num_logical_errors / num_shots)
 
@@ -583,7 +581,6 @@ class RareEventSimulator:
                                       init_sample=failure_sample)
         end = time()
 
-        results["timing"] = {}
         results["timing"]["markov-chain"] = [end - start]
         results["timing"]["binary-search"] = []
         results["C"] = []
@@ -616,6 +613,10 @@ class RareEventSimulator:
 
         results["physical-error-rates"] = ps
         results["logical-error-rates"] = logical_error_rates
+
+        total_end = time()
+
+        results["timing"]["total"] = total_end - total_start
 
         return results
 
@@ -677,5 +678,5 @@ if __name__ == '__main__':
     
     results = sim.run()
 
-    with open(f"d={args.distance}.json", "w") as f:
+    with open(f"results/mcmc/d={args.distance}.json", "w") as f:
         json.dump(results, f, indent=4)
